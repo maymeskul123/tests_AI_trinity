@@ -1,0 +1,3 @@
+agent,success_rate,avg_final_accuracy,avg_steps_solved,avg_nonzero
+BINARY,1.0,1.0,75.34,21.0
+TERNARY,1.0,1.0,71.26,14.22
