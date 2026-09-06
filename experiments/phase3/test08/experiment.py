@@ -19,8 +19,7 @@ except ImportError:
     print("Warning: matplotlib not installed, skipping plots.")
 
 # ============================================================
-# TEST08 — ОПТИМИЗАЦИЯ ПОРОГА УВЕРЕННОСТИ
-# Варьируем CONF_THRESHOLD от 0.0 до 1.0
+# TEST08 — ОПТИМИЗАЦИЯ ПОРОГА УВЕРЕННОСТИ (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 # ============================================================
 
 @dataclass(frozen=True)
@@ -130,7 +129,7 @@ def generate_evidence(config: ScenarioConfig, seed: int, n_obs: int) -> tuple[in
     return true_candidate, evidence
 
 def active_learning(config: ScenarioConfig, seed: int, policy_func,
-                    max_queries: int = 5, confidence_threshold: float = 0.5) -> tuple[int, int, bool, float]:
+                    max_queries: int = 5, confidence_threshold: float = 0.5) -> tuple[int, int, bool, float, int]:
     n_obs = config.n_obs_initial
     true_cand, evidence = generate_evidence(config, seed, n_obs)
     queries = 0
@@ -155,22 +154,23 @@ def active_learning(config: ScenarioConfig, seed: int, policy_func,
         final_confidence = confidence
 
     correct = (final_decision == true_cand) if final_decision is not None else False
-    return final_decision, queries, correct, final_confidence
+    return final_decision, queries, correct, final_confidence, true_cand
 
 def run_scenario_packed(args: tuple) -> dict:
     scenario_id, config, seed, policy_name, max_queries, conf_threshold = args
     policy_func = POLICIES[policy_name]
-    decision, queries, correct, confidence = active_learning(
+    decision, queries, correct, confidence, true_cand = active_learning(
         config, seed, policy_func, max_queries, conf_threshold
     )
     return {
         "scenario_id": scenario_id,
         "policy": policy_name,
-        "true_candidate": 0,  # мы не знаем true_candidate, но можем передать из generate_evidence
+        "true_candidate": true_cand,
         "decision": str(decision) if decision is not None else "ABSTAIN",
         "correct": int(correct),
         "queries": queries,
         "confidence": confidence,
+        "confidence_threshold": conf_threshold,
         "n_candidates": config.n_candidates,
         "n_obs_initial": config.n_obs_initial,
         "p_true_support": config.p_true_support,
@@ -214,7 +214,6 @@ def main():
     SEED_OFFSET = 42
     MAX_QUERIES = 5
 
-    # Варьируем порог уверенности
     THRESHOLDS = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
     tasks = []
@@ -242,23 +241,14 @@ def main():
             if (i + 1) % 1000 == 0:
                 print(f"Processed {i+1}/{len(tasks)} scenarios")
 
-    # Агрегация по политикам и порогам
-    print("\n=== Overall by Policy and Threshold ===")
-    policy_threshold_agg = defaultdict(lambda: defaultdict(list))
-    for r in results:
-        policy = r["policy"]
-        # Извлекаем порог из сценария (он не сохранён в CSV, но мы можем передать его в задачу)
-        # В текущей реализации порог не сохраняется в results. Нужно добавить поле.
-        # Временное решение: группируем только по политике.
-        policy_threshold_agg[policy]["all"].append(r)
-
     # Сохранение CSV
     output_csv = Path("results/phase3/test08/results.csv")
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
     fieldnames = [
         "scenario_id", "policy", "true_candidate", "decision", "correct",
-        "queries", "confidence", "n_candidates", "n_obs_initial",
+        "queries", "confidence", "confidence_threshold",
+        "n_candidates", "n_obs_initial",
         "p_true_support", "p_true_conflict", "p_false_support", "p_false_conflict",
     ]
     with output_csv.open("w", newline="") as f:
@@ -269,6 +259,16 @@ def main():
 
     print(f"\nResults written to {output_csv}")
 
+    # Агрегация по политикам и порогам
+    print("\n=== Overall by Policy and Threshold ===")
+    for policy_name in POLICIES:
+        print(f"\n{policy_name}:")
+        for threshold in THRESHOLDS:
+            rows = [r for r in results if r["policy"] == policy_name and abs(r["confidence_threshold"] - threshold) < 0.001]
+            if rows:
+                agg = aggregate_results(rows)
+                print(f"  threshold={threshold:.1f}: accuracy={agg['accuracy']:.3f}, avg_queries={agg['avg_queries']:.2f}")
+
     # Агрегация по политикам (общая)
     print("\n=== Overall by Policy ===")
     for policy_name in POLICIES:
@@ -276,7 +276,7 @@ def main():
         agg = aggregate_results(rows)
         print(f"{policy_name:12s} accuracy={agg['accuracy']:.3f}, avg_queries={agg['avg_queries']:.2f}")
 
-    # Визуализация (если есть matplotlib)
+    # Визуализация
     if HAS_MATPLOTLIB:
         print("\nGenerating plots...")
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -284,11 +284,38 @@ def main():
         # Plot 1: Accuracy vs Threshold
         ax = axes[0]
         for policy_name in POLICIES:
-            rows = [r for r in results if r["policy"] == policy_name]
-            # Группируем по порогу (если бы мы его сохраняли)
-            # Пока строим только общую accuracy
-            # Временное решение: строим просто точки
-            pass
+            x_vals = []
+            y_vals = []
+            for threshold in THRESHOLDS:
+                rows = [r for r in results if r["policy"] == policy_name and abs(r["confidence_threshold"] - threshold) < 0.001]
+                if rows:
+                    agg = aggregate_results(rows)
+                    x_vals.append(threshold)
+                    y_vals.append(agg["accuracy"])
+            ax.plot(x_vals, y_vals, marker='o', label=policy_name)
+        ax.set_title("Accuracy vs Confidence Threshold")
+        ax.set_xlabel("Confidence Threshold")
+        ax.set_ylabel("Accuracy")
+        ax.legend()
+        ax.grid(True)
+
+        # Plot 2: Avg Queries vs Threshold
+        ax = axes[1]
+        for policy_name in POLICIES:
+            x_vals = []
+            y_vals = []
+            for threshold in THRESHOLDS:
+                rows = [r for r in results if r["policy"] == policy_name and abs(r["confidence_threshold"] - threshold) < 0.001]
+                if rows:
+                    agg = aggregate_results(rows)
+                    x_vals.append(threshold)
+                    y_vals.append(agg["avg_queries"])
+            ax.plot(x_vals, y_vals, marker='s', label=policy_name)
+        ax.set_title("Average Queries vs Confidence Threshold")
+        ax.set_xlabel("Confidence Threshold")
+        ax.set_ylabel("Average Queries")
+        ax.legend()
+        ax.grid(True)
 
         plt.tight_layout()
         plot_path = "results/phase3/test08/summary_plots.png"
