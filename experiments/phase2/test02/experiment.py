@@ -3,19 +3,20 @@ from __future__ import annotations
 import csv
 import math
 import random
+import numpy as np
 from dataclasses import dataclass
 import multiprocessing as mp
 from functools import partial
 
 # ============================================================
-# TEST01 — УЛУЧШЕННАЯ БАЙЕСОВСКАЯ АДАПТАЦИЯ ПОРОГА (Phase 2)
-# Порог = max(1, round(1.5 * entropy + 1))
-# Сравниваем с фиксированным порогом 3 и обычным Threshold
+# TEST02 — ГИБРИДНАЯ НЕЙРО-СИМВОЛЬНАЯ СИСТЕМА (Phase 2)
+# Нейросеть оценивает вероятности, затем преобразует в состояния
+# и применяет Threshold-логику.
 # ============================================================
 
 N_H = 16
 N_Q = 8
-EPISODES = 2000
+EPISODES = 1500
 BUDGETS = [5, 7, 10]
 CONFLICT_RATES = [0.0, 0.2, 0.4]
 
@@ -99,6 +100,67 @@ def expected_information_gain(prior, q, conflict_rate):
             p_obs += prior[h] * lik
         after += p_obs * entropy(post)
     return max(0.0, before - after)
+
+# ---------- ГЕНЕРАЦИЯ ДАННЫХ ДЛЯ ОБУЧЕНИЯ НЕЙРОСЕТИ ----------
+def generate_training_data(n_samples=10000, conflict_rate=0.0, seed=42):
+    rng = random.Random(seed)
+    data = []
+    for _ in range(n_samples):
+        h = rng.randrange(N_H)
+        true_answers = [QUESTIONS[q][h] for q in range(N_Q)]
+        noisy_answers = []
+        for ans in true_answers:
+            if rng.random() < conflict_rate:
+                noisy_answers.append(1 - ans)
+            else:
+                noisy_answers.append(ans)
+        data.append((noisy_answers, h))
+    return data
+
+# ---------- ПРОСТАЯ НЕЙРОСЕТЬ ----------
+class SimpleNN:
+    def __init__(self, input_dim=N_Q, hidden_dim=32, output_dim=N_H):
+        self.W1 = np.random.randn(input_dim, hidden_dim) * 0.01
+        self.b1 = np.zeros(hidden_dim)
+        self.W2 = np.random.randn(hidden_dim, output_dim) * 0.01
+        self.b2 = np.zeros(output_dim)
+
+    def forward(self, x):
+        h = np.maximum(0, x @ self.W1 + self.b1)
+        logits = h @ self.W2 + self.b2
+        exp_logits = np.exp(logits - np.max(logits))
+        probs = exp_logits / np.sum(exp_logits)
+        return probs
+
+    def train(self, data, epochs=20, lr=0.01):
+        for epoch in range(epochs):
+            rng = random.Random(epoch + 42)
+            indices = list(range(len(data)))
+            rng.shuffle(indices)
+            total_loss = 0.0
+            for idx in indices:
+                x, target = data[idx]
+                x = np.array(x, dtype=np.float32)
+                h = np.maximum(0, x @ self.W1 + self.b1)
+                logits = h @ self.W2 + self.b2
+                exp_logits = np.exp(logits - np.max(logits))
+                probs = exp_logits / np.sum(exp_logits)
+                loss = -np.log(probs[target] + 1e-8)
+                total_loss += loss
+                dlogits = probs.copy()
+                dlogits[target] -= 1.0
+                dW2 = np.outer(h, dlogits)
+                db2 = dlogits
+                dh = dlogits @ self.W2.T
+                dh[h <= 0] = 0
+                dW1 = np.outer(x, dh)
+                db1 = dh
+                self.W2 -= lr * dW2
+                self.b2 -= lr * db2
+                self.W1 -= lr * dW1
+                self.b1 -= lr * db1
+            if epoch % 5 == 0:
+                print(f"  Epoch {epoch}: loss = {total_loss / len(data):.4f}")
 
 # ---------- АГЕНТЫ ----------
 class BinaryAgent:
@@ -254,26 +316,27 @@ class QuaternaryThresholdAgent:
             return confirmed[0]
         return None
 
-# ---------- БАЙЕСОВСКИЙ АДАПТИВНЫЙ ПОРОГ (улучшенный) ----------
-class BayesianAdaptiveAgent:
-    def __init__(self, seed):
+# ---------- ГИБРИДНЫЙ АГЕНТ ----------
+class HybridAgent:
+    def __init__(self, seed, nn):
         self.rng = random.Random(seed)
+        self.nn = nn
         self.reset()
 
     def reset(self):
         self.states = [UNKNOWN] * N_H
         self.counter = [0] * N_H
-        self.entropy_history = []
-
-    def compute_threshold(self):
-        if len(self.entropy_history) == 0:
-            return 2
-        avg_entropy = sum(self.entropy_history[-5:]) / min(5, len(self.entropy_history))
-        # Порог = max(1, round(1.5 * avg_entropy + 1))
-        threshold = max(1, round(1.5 * avg_entropy + 1))
-        return threshold
+        self.observations = []  # список (q, value)
 
     def choose_question(self, conflict_rate):
+        # Строим входной вектор для нейросети
+        input_vec = [0.5] * N_Q
+        for q, value in self.observations:
+            input_vec[q] = value
+        probs = self.nn.forward(np.array(input_vec, dtype=np.float32))
+        # Выбираем вопрос с максимальной энтропией (или случайно, упрощаем)
+        # Для простоты используем стандартную логику Threshold для выбора вопроса
+        # (можно улучшить)
         active = [h for h in HYPOTHESES if self.states[h] != WRONG]
         if len(active) <= 1:
             return None
@@ -305,16 +368,10 @@ class BayesianAdaptiveAgent:
         return best_q
 
     def observe(self, q, value):
+        self.observations.append((q, value))
         if value == UNKNOWN:
             return
-        # Сохраняем энтропию до обновления
-        active = [h for h in HYPOTHESES if self.states[h] != WRONG]
-        if active:
-            prior = [1.0/len(active) if h in active else 0.0 for h in HYPOTHESES]
-            self.entropy_history.append(entropy(prior))
-
-        threshold = self.compute_threshold()
-
+        # Обновляем состояния по Threshold-логике
         for h in HYPOTHESES:
             state = self.states[h]
             if state == WRONG:
@@ -329,23 +386,38 @@ class BayesianAdaptiveAgent:
                     self.counter[h] = 1
                 elif state == CONFLICT:
                     self.counter[h] += 1
-                    if self.counter[h] >= threshold:
+                    if self.counter[h] >= FIXED_THRESHOLD:
                         self.states[h] = WRONG
                 else:
                     self.states[h] = WRONG
 
     def answer(self):
+        # Сначала пробуем нейросеть
+        if len(self.observations) >= 3:
+            input_vec = [0.5] * N_Q
+            for q, value in self.observations:
+                input_vec[q] = value
+            probs = self.nn.forward(np.array(input_vec, dtype=np.float32))
+            max_prob = np.max(probs)
+            if max_prob > 0.6:
+                sorted_probs = np.sort(probs)[::-1]
+                if len(sorted_probs) > 1 and (sorted_probs[0] - sorted_probs[1]) > 0.1:
+                    return np.argmax(probs)
+        # Иначе дискретная логика
         confirmed = [h for h in HYPOTHESES if self.states[h] == RIGHT]
         if len(confirmed) == 1:
             return confirmed[0]
         return None
 
 # ---------- ЭКСПЕРИМЕНТ ----------
-def run_episode(AgentClass, seed, budget, conflict_rate):
+def run_episode(AgentClass, seed, budget, conflict_rate, nn=None):
     rng = random.Random(seed)
     target = rng.randrange(N_H)
     env = Environment(target, conflict_rate, rng)
-    agent = AgentClass(seed)
+    if AgentClass == HybridAgent:
+        agent = HybridAgent(seed, nn)
+    else:
+        agent = AgentClass(seed)
     prior = [1.0/N_H] * N_H
     queries = 0
     false_confidence = 0
@@ -389,21 +461,34 @@ def aggregate(rows):
     return {key: sum(r[key] for r in rows)/n for key in rows[0]}
 
 def main():
+    # Обучаем нейросети для каждого уровня шума
+    nns = {}
+    for cr in CONFLICT_RATES:
+        print(f"Training NN for conflict_rate={cr}...")
+        data = generate_training_data(n_samples=8000, conflict_rate=cr, seed=42)
+        nn = SimpleNN()
+        nn.train(data, epochs=15, lr=0.01)
+        nns[cr] = nn
+
     out = []
     pool = mp.Pool(mp.cpu_count())
 
     for conflict_rate in CONFLICT_RATES:
         print(f"\n=== conflict_rate = {conflict_rate:.1f} ===")
+        nn = nns[conflict_rate]
         for budget in BUDGETS:
             for name, AgentClass in [("BINARY", BinaryAgent),
                                      ("TERNARY", TernaryAgent),
                                      ("THRESHOLD", QuaternaryThresholdAgent),
-                                     ("BAYESIAN_ADAPTIVE", BayesianAdaptiveAgent)]:
+                                     ("HYBRID", HybridAgent)]:
                 seeds = [ep + budget*100000 + int(conflict_rate*1000) for ep in range(EPISODES)]
-                func = partial(run_episode, AgentClass, budget=budget, conflict_rate=conflict_rate)
+                if name == "HYBRID":
+                    func = partial(run_episode, HybridAgent, budget=budget, conflict_rate=conflict_rate, nn=nn)
+                else:
+                    func = partial(run_episode, AgentClass, budget=budget, conflict_rate=conflict_rate, nn=None)
                 results = pool.map(func, seeds)
                 res = aggregate(results)
-                print(f"{name:18s} b={budget:2d} acc={res['correct']:.4f} "
+                print(f"{name:10s} b={budget:2d} acc={res['correct']:.4f} "
                       f"false={res['false_confidence']:.4f} abst={res['abstain']:.4f} reward={res['reward']:.4f}")
                 out.append({
                     "conflict_rate": conflict_rate,
@@ -415,7 +500,7 @@ def main():
     pool.close()
     pool.join()
 
-    path = "results/phase2/test01/results.csv"
+    path = "results/phase2/test02/results.csv"
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=out[0].keys())
         writer.writeheader()
